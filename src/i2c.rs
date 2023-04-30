@@ -7,7 +7,7 @@ use core::task::Poll;
 use embedded_hal::blocking::i2c::{Operation, Read, Transactional, Write};
 use embedded_hal::digital::v2::InputPin;
 
-use crate::Interface;
+use crate::{AsyncInterface, Interface};
 
 /// To be used in `Interface::wait_ready` implementations
 pub const PN532_I2C_READY: u8 = 0x01;
@@ -101,5 +101,38 @@ where
             I2C_ADDRESS,
             &mut [Operation::Read(&mut [0]), Operation::Read(buf)],
         )
+    }
+}
+
+pub struct AsyncI2cInterface<I2C>
+where
+    I2C: embedded_hal_async::i2c::I2c,
+{
+    pub i2c: I2C,
+}
+
+impl<I2C> AsyncInterface for AsyncI2cInterface<I2C>
+where
+    I2C: embedded_hal_async::i2c::I2c,
+{
+    type Error = I2C::Error;
+
+    async fn write(&mut self, frame: &[u8]) -> Result<(), Self::Error> {
+        self.i2c.write(I2C_ADDRESS, frame).await
+    }
+
+    async fn wait_ready(&mut self) -> Result<(), Self::Error> {
+        let mut buf = [0];
+
+        loop {
+            self.i2c.read(I2C_ADDRESS, &mut buf).await?;
+            if buf[0] == PN532_I2C_READY {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn read(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
+        self.i2c.read(I2C_ADDRESS, buf).await
     }
 }

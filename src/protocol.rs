@@ -1,12 +1,4 @@
 use core::fmt::Debug;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-
-use embedded_hal::timer::CountDown;
-
-use crate::requests::{BorrowedRequest, Command};
-use crate::{Interface, Request};
 
 const PREAMBLE: [u8; 3] = [0x00, 0x00, 0xFF];
 const POSTAMBLE: u8 = 0x00;
@@ -42,315 +34,513 @@ impl<E: Debug> From<E> for Error<E> {
     }
 }
 
-/// Main struct of this crate
-///
-/// Provides blocking methods [`process`](Pn532::process) and [`process_async`](Pn532::process_async)
-/// for sending requests and parsing responses.
-///
-/// Other methods can be used if fine-grain control is required.
-///
-/// # Note:
-/// The `Pn532` uses an internal buffer for sending and receiving messages.
-/// The size of the buffer is determined by the `N` type parameter which has a default value of `32`.
-///
-/// Choosing `N` too small will result in **panics**.
-///
-/// The following inequality should hold for all requests and responses:
-/// ```text
-/// N - 9 >= max(response_len, M)
-/// ```
-/// where
-/// * `N` is the const generic type parameter of this struct.
-/// * `response_len` is the largest number passed to
-/// [`receive_response`](Pn532::receive_response), [`process`](Pn532::process) or [`process_async`](Pn532::process_async)
-/// * `M` is the largest const generic type parameter of [`Request`] references passed to any sending methods of this struct
-#[derive(Clone, Debug)]
-pub struct Pn532<I, T, const N: usize = 32> {
-    pub interface: I,
-    pub timer: T,
-    buf: [u8; N],
-}
+pub mod sync {
+    use embedded_hal::timer::CountDown;
 
-impl<I: Interface, T: CountDown, const N: usize> Pn532<I, T, N> {
-    /// Send a request, wait for an ACK and then wait for a response.
+    use crate::protocol::{HOST_TO_PN532, POSTAMBLE, PREAMBLE};
+    use crate::requests::{BorrowedRequest, Command};
+    use crate::{Error, Interface, Request};
+
+    use super::{ACK, parse_response};
+    /// Main struct of this crate
     ///
-    /// `response_len` is the largest expected length of the returned data.
+    /// Provides blocking methods [`process`](Pn532::process) and [`process_async`](Pn532::process_async)
+    /// for sending requests and parsing responses.
     ///
+    /// Other methods can be used if fine-grain control is required.
+    ///
+    /// # Note:
+    /// The `Pn532` uses an internal buffer for sending and receiving messages.
+    /// The size of the buffer is determined by the `N` type parameter which has a default value of `32`.
+    ///
+    /// Choosing `N` too small will result in **panics**.
+    ///
+    /// The following inequality should hold for all requests and responses:
+    /// ```text
+    /// N - 9 >= max(response_len, M)
     /// ```
-    /// # use pn532::doc_test_helper::get_pn532;
-    /// use pn532::Request;
-    /// use pn532::IntoDuration; // trait for `ms()`, your HAL might have its own
-    ///
-    /// let mut pn532 = get_pn532();
-    /// let result = pn532.process(&Request::GET_FIRMWARE_VERSION, 4, 50.ms());
-    /// ```
-    #[inline]
-    pub fn process<const M: usize>(
-        &mut self,
-        request: &Request<M>,
-        response_len: usize,
-        timeout: T::Time,
-    ) -> Result<&[u8], Error<I::Error>> {
-        // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-        self._process(request.borrow(), response_len, timeout)
+    /// where
+    /// * `N` is the const generic type parameter of this struct.
+    /// * `response_len` is the largest number passed to
+    /// [`receive_response`](Pn532::receive_response), [`process`](Pn532::process) or [`process_async`](Pn532::process_async)
+    /// * `M` is the largest const generic type parameter of [`Request`] references passed to any sending methods of this struct
+    #[derive(Clone, Debug)]
+    pub struct Pn532<I, T, const N: usize = 32> {
+        pub interface: I,
+        pub timer: T,
+        buf: [u8; N],
     }
-    fn _process(
-        &mut self,
-        request: BorrowedRequest<'_>,
-        response_len: usize,
-        timeout: T::Time,
-    ) -> Result<&[u8], Error<I::Error>> {
-        let sent_command = request.command;
-        self.timer.start(timeout);
-        self._send(request)?;
-        while self.interface.wait_ready()?.is_pending() {
-            if self.timer.wait().is_ok() {
-                return Err(Error::TimeoutAck);
+
+    impl<I: Interface, T: CountDown, const N: usize> Pn532<I, T, N> {
+        /// Send a request, wait for an ACK and then wait for a response.
+        ///
+        /// `response_len` is the largest expected length of the returned data.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use pn532::Request;
+        /// use pn532::IntoDuration; // trait for `ms()`, your HAL might have its own
+        ///
+        /// let mut pn532 = get_pn532();
+        /// let result = pn532.process(&Request::GET_FIRMWARE_VERSION, 4, 50.ms());
+        /// ```
+        #[inline]
+        pub fn process<const M: usize>(
+            &mut self,
+            request: &Request<M>,
+            response_len: usize,
+            timeout: T::Time,
+        ) -> Result<&[u8], Error<I::Error>> {
+            // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
+            self._process(request.borrow(), response_len, timeout)
+        }
+        fn _process(
+            &mut self,
+            request: BorrowedRequest<'_>,
+            response_len: usize,
+            timeout: T::Time,
+        ) -> Result<&[u8], Error<I::Error>> {
+            let sent_command = request.command;
+            self.timer.start(timeout);
+            self._send(request)?;
+            while self.interface.wait_ready()?.is_pending() {
+                if self.timer.wait().is_ok() {
+                    return Err(Error::TimeoutAck);
+                }
+            }
+            self.receive_ack()?;
+            while self.interface.wait_ready()?.is_pending() {
+                if self.timer.wait().is_ok() {
+                    return Err(Error::TimeoutResponse);
+                }
+            }
+            self.receive_response(sent_command, response_len)
+        }
+
+        /// Send a request and wait for an ACK.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use pn532::Request;
+        /// use pn532::IntoDuration; // trait for `ms()`, your HAL might have its own
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.process_no_response(&Request::INLIST_ONE_ISO_A_TARGET, 5.ms());
+        /// ```
+        #[inline]
+        pub fn process_no_response<const M: usize>(
+            &mut self,
+            request: &Request<M>,
+            timeout: T::Time,
+        ) -> Result<(), Error<I::Error>> {
+            // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
+            self._process_no_response(request.borrow(), timeout)
+        }
+        fn _process_no_response(
+            &mut self,
+            request: BorrowedRequest<'_>,
+            timeout: T::Time,
+        ) -> Result<(), Error<I::Error>> {
+            self.timer.start(timeout);
+            self._send(request)?;
+            while self.interface.wait_ready()?.is_pending() {
+                if self.timer.wait().is_ok() {
+                    return Err(Error::TimeoutAck);
+                }
+            }
+            self.receive_ack()
+        }
+    }
+    impl<I: Interface, T, const N: usize> Pn532<I, T, N> {
+        /// Create a Pn532 instance
+        pub fn new(interface: I, timer: T) -> Self {
+            Pn532 {
+                interface,
+                timer,
+                buf: [0; N],
             }
         }
-        self.receive_ack()?;
-        while self.interface.wait_ready()?.is_pending() {
-            if self.timer.wait().is_ok() {
-                return Err(Error::TimeoutResponse);
+
+        /// Send a request.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use pn532::Request;
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.send(&Request::GET_FIRMWARE_VERSION);
+        /// ```
+        #[inline]
+        pub fn send<const M: usize>(
+            &mut self,
+            request: &Request<M>,
+        ) -> Result<(), Error<I::Error>> {
+            // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
+            self._send(request.borrow())
+        }
+        fn _send(&mut self, request: BorrowedRequest<'_>) -> Result<(), Error<I::Error>> {
+            let data_len = request.data.len();
+            let frame_len = 2 + data_len as u8; // frame identifier + command + data
+
+            let mut data_sum = HOST_TO_PN532.wrapping_add(request.command as u8); // sum(command + data + frame identifier)
+            for &byte in request.data {
+                data_sum = data_sum.wrapping_add(byte);
+            }
+
+            const fn to_checksum(sum: u8) -> u8 {
+                (!sum).wrapping_add(1)
+            }
+
+            self.buf[0] = PREAMBLE[0];
+            self.buf[1] = PREAMBLE[1];
+            self.buf[2] = PREAMBLE[2];
+            self.buf[3] = frame_len;
+            self.buf[4] = to_checksum(frame_len);
+            self.buf[5] = HOST_TO_PN532;
+            self.buf[6] = request.command as u8;
+
+            self.buf[7..7 + data_len].copy_from_slice(request.data);
+
+            self.buf[7 + data_len] = to_checksum(data_sum);
+            self.buf[8 + data_len] = POSTAMBLE;
+
+            self.interface.write(&self.buf[..9 + data_len])?;
+            Ok(())
+        }
+
+        /// Receive an ACK frame.
+        /// This should be done after [`send`](Pn532::send) was called and the interface was checked to be ready.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use core::task::Poll;
+        /// use pn532::{Interface, Request};
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.send(&Request::GET_FIRMWARE_VERSION);
+        /// // do something else
+        /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
+        ///     pn532.receive_ack();
+        /// }
+        /// ```
+        pub fn receive_ack(&mut self) -> Result<(), Error<I::Error>> {
+            let mut ack_buf = [0; 6];
+            self.interface.read(&mut ack_buf)?;
+            if ack_buf != ACK {
+                Err(Error::BadAck)
+            } else {
+                Ok(())
             }
         }
-        self.receive_response(sent_command, response_len)
-    }
 
-    /// Send a request and wait for an ACK.
-    ///
-    /// ```
-    /// # use pn532::doc_test_helper::get_pn532;
-    /// use pn532::Request;
-    /// use pn532::IntoDuration; // trait for `ms()`, your HAL might have its own
-    ///
-    /// let mut pn532 = get_pn532();
-    /// pn532.process_no_response(&Request::INLIST_ONE_ISO_A_TARGET, 5.ms());
-    /// ```
-    #[inline]
-    pub fn process_no_response<const M: usize>(
-        &mut self,
-        request: &Request<M>,
-        timeout: T::Time,
-    ) -> Result<(), Error<I::Error>> {
-        // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-        self._process_no_response(request.borrow(), timeout)
-    }
-    fn _process_no_response(
-        &mut self,
-        request: BorrowedRequest<'_>,
-        timeout: T::Time,
-    ) -> Result<(), Error<I::Error>> {
-        self.timer.start(timeout);
-        self._send(request)?;
-        while self.interface.wait_ready()?.is_pending() {
-            if self.timer.wait().is_ok() {
-                return Err(Error::TimeoutAck);
-            }
-        }
-        self.receive_ack()
-    }
-}
-impl<I: Interface, T, const N: usize> Pn532<I, T, N> {
-    /// Create a Pn532 instance
-    pub fn new(interface: I, timer: T) -> Self {
-        Pn532 {
-            interface,
-            timer,
-            buf: [0; N],
-        }
-    }
-
-    /// Send a request.
-    ///
-    /// ```
-    /// # use pn532::doc_test_helper::get_pn532;
-    /// use pn532::Request;
-    ///
-    /// let mut pn532 = get_pn532();
-    /// pn532.send(&Request::GET_FIRMWARE_VERSION);
-    /// ```
-    #[inline]
-    pub fn send<const M: usize>(&mut self, request: &Request<M>) -> Result<(), Error<I::Error>> {
-        // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-        self._send(request.borrow())
-    }
-    fn _send(&mut self, request: BorrowedRequest<'_>) -> Result<(), Error<I::Error>> {
-        let data_len = request.data.len();
-        let frame_len = 2 + data_len as u8; // frame identifier + command + data
-
-        let mut data_sum = HOST_TO_PN532.wrapping_add(request.command as u8); // sum(command + data + frame identifier)
-        for &byte in request.data {
-            data_sum = data_sum.wrapping_add(byte);
+        /// Receive a response frame.
+        /// This should be done after [`send`](Pn532::send) and [`receive_ack`](Pn532::receive_ack) was called and
+        /// the interface was checked to be ready.
+        ///
+        /// `response_len` is the largest expected length of the returned data.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use core::task::Poll;
+        /// use pn532::{Interface, Request};
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.send(&Request::GET_FIRMWARE_VERSION);
+        /// // do something else
+        /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
+        ///     pn532.receive_ack();
+        /// }
+        /// // do something else
+        /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
+        ///     let result = pn532.receive_response(Request::GET_FIRMWARE_VERSION.command, 4);
+        /// }
+        /// ```
+        pub fn receive_response(
+            &mut self,
+            sent_command: Command,
+            response_len: usize,
+        ) -> Result<&[u8], Error<I::Error>> {
+            let response_buf = &mut self.buf[..response_len + 9];
+            response_buf.fill(0); // zero out buf
+            self.interface.read(response_buf)?;
+            let expected_response_command = sent_command as u8 + 1;
+            parse_response(response_buf, expected_response_command)
         }
 
-        const fn to_checksum(sum: u8) -> u8 {
-            (!sum).wrapping_add(1)
-        }
-
-        self.buf[0] = PREAMBLE[0];
-        self.buf[1] = PREAMBLE[1];
-        self.buf[2] = PREAMBLE[2];
-        self.buf[3] = frame_len;
-        self.buf[4] = to_checksum(frame_len);
-        self.buf[5] = HOST_TO_PN532;
-        self.buf[6] = request.command as u8;
-
-        self.buf[7..7 + data_len].copy_from_slice(request.data);
-
-        self.buf[7 + data_len] = to_checksum(data_sum);
-        self.buf[8 + data_len] = POSTAMBLE;
-
-        self.interface.write(&self.buf[..9 + data_len])?;
-        Ok(())
-    }
-
-    /// Receive an ACK frame.
-    /// This should be done after [`send`](Pn532::send) was called and the interface was checked to be ready.
-    ///
-    /// ```
-    /// # use pn532::doc_test_helper::get_pn532;
-    /// use core::task::Poll;
-    /// use pn532::{Interface, Request};
-    ///
-    /// let mut pn532 = get_pn532();
-    /// pn532.send(&Request::GET_FIRMWARE_VERSION);
-    /// // do something else
-    /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
-    ///     pn532.receive_ack();
-    /// }
-    /// ```
-    pub fn receive_ack(&mut self) -> Result<(), Error<I::Error>> {
-        let mut ack_buf = [0; 6];
-        self.interface.read(&mut ack_buf)?;
-        if ack_buf != ACK {
-            Err(Error::BadAck)
-        } else {
+        /// Send an ACK frame to force the PN532 to abort the current process.
+        /// In that case, the PN532 discontinues the last processing and does not answer anything
+        /// to the host controller.
+        /// Then, the PN532 starts again waiting for a new command.
+        pub fn abort(&mut self) -> Result<(), Error<I::Error>> {
+            self.interface.write(&ACK)?;
             Ok(())
         }
     }
+}
 
-    /// Receive a response frame.
-    /// This should be done after [`send`](Pn532::send) and [`receive_ack`](Pn532::receive_ack) was called and
-    /// the interface was checked to be ready.
+pub mod asynk {
+    use core::pin::pin;
+
+    use embedded_hal_async::delay::DelayUs;
+    use futures::future::select;
+    use rtt_target::rprintln;
+
+    use crate::protocol::{HOST_TO_PN532, POSTAMBLE, PREAMBLE};
+    use crate::requests::{BorrowedRequest, Command};
+    use crate::{AsyncInterface, Error, Request};
+
+    use super::{ACK, parse_response};
+    /// Main struct of this crate
     ///
-    /// `response_len` is the largest expected length of the returned data.
+    /// Provides blocking methods [`process`](Pn532::process) and [`process_async`](Pn532::process_async)
+    /// for sending requests and parsing responses.
     ///
+    /// Other methods can be used if fine-grain control is required.
+    ///
+    /// # Note:
+    /// The `Pn532` uses an internal buffer for sending and receiving messages.
+    /// The size of the buffer is determined by the `N` type parameter which has a default value of `32`.
+    ///
+    /// Choosing `N` too small will result in **panics**.
+    ///
+    /// The following inequality should hold for all requests and responses:
+    /// ```text
+    /// N - 9 >= max(response_len, M)
     /// ```
-    /// # use pn532::doc_test_helper::get_pn532;
-    /// use core::task::Poll;
-    /// use pn532::{Interface, Request};
-    ///
-    /// let mut pn532 = get_pn532();
-    /// pn532.send(&Request::GET_FIRMWARE_VERSION);
-    /// // do something else
-    /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
-    ///     pn532.receive_ack();
-    /// }
-    /// // do something else
-    /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
-    ///     let result = pn532.receive_response(Request::GET_FIRMWARE_VERSION.command, 4);
-    /// }
-    /// ```
-    pub fn receive_response(
-        &mut self,
-        sent_command: Command,
-        response_len: usize,
-    ) -> Result<&[u8], Error<I::Error>> {
-        let response_buf = &mut self.buf[..response_len + 9];
-        response_buf.fill(0); // zero out buf
-        self.interface.read(response_buf)?;
-        let expected_response_command = sent_command as u8 + 1;
-        parse_response(response_buf, expected_response_command)
+    /// where
+    /// * `N` is the const generic type parameter of this struct.
+    /// * `response_len` is the largest number passed to
+    /// [`receive_response`](Pn532::receive_response), [`process`](Pn532::process) or [`process_async`](Pn532::process_async)
+    /// * `M` is the largest const generic type parameter of [`Request`] references passed to any sending methods of this struct
+    #[derive(Clone, Debug)]
+    pub struct Pn532Async<I, T, const N: usize = 32> {
+        pub interface: I,
+        pub timer: T,
+        buf: [u8; N],
     }
 
-    /// Send an ACK frame to force the PN532 to abort the current process.
-    /// In that case, the PN532 discontinues the last processing and does not answer anything
-    /// to the host controller.
-    /// Then, the PN532 starts again waiting for a new command.
-    pub fn abort(&mut self) -> Result<(), Error<I::Error>> {
-        self.interface.write(&ACK)?;
-        Ok(())
+    impl<I: AsyncInterface, T: DelayUs, const N: usize> Pn532Async<I, T, N> {
+        /// Send a request, wait for an ACK and then wait for a response.
+        ///
+        /// `response_len` is the largest expected length of the returned data.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use pn532::Request;
+        /// use pn532::IntoDuration; // trait for `ms()`, your HAL might have its own
+        ///
+        /// let mut pn532 = get_pn532();
+        /// let result = pn532.process(&Request::GET_FIRMWARE_VERSION, 4, 50.ms());
+        /// ```
+        #[inline]
+        pub async fn process<const M: usize>(
+            &mut self,
+            request: &Request<M>,
+            response_len: usize,
+            timeout_ms: u32,
+        ) -> Result<&[u8], Error<I::Error>> {
+            // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
+            self._process(request.borrow(), response_len, timeout_ms)
+                .await
+        }
+        async fn _process(
+            &mut self,
+            request: BorrowedRequest<'_>,
+            response_len: usize,
+            timeout_ms: u32,
+        ) -> Result<&[u8], Error<I::Error>> {
+            let sent_command = request.command;
+            self._send(request).await?;
+            match select(
+                pin!(self.interface.wait_ready()),
+                pin!(self.timer.delay_ms(timeout_ms)),
+            )
+            .await
+            {
+                futures::future::Either::Left((wait_res, _)) => wait_res?,
+                futures::future::Either::Right((_timeout, _)) => return Err(Error::TimeoutAck),
+            };
+            self.receive_ack().await?;
+            match select(
+                pin!(self.interface.wait_ready()),
+                pin!(self.timer.delay_ms(timeout_ms)),
+            )
+            .await
+            {
+                futures::future::Either::Left((wait_res, _)) => wait_res?,
+                futures::future::Either::Right((_timeout, _)) => {
+                    return Err(Error::TimeoutResponse)
+                }
+            };
+            self.receive_response(sent_command, response_len).await
+        }
+
+        /// Send a request and wait for an ACK.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use pn532::Request;
+        /// use pn532::IntoDuration; // trait for `ms()`, your HAL might have its own
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.process_no_response(&Request::INLIST_ONE_ISO_A_TARGET, 5.ms());
+        /// ```
+        #[inline]
+        pub async fn process_no_response<const M: usize>(
+            &mut self,
+            request: &Request<M>,
+            timeout_ms: u32,
+        ) -> Result<(), Error<I::Error>> {
+            // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
+            self._process_no_response(request.borrow(), timeout_ms)
+                .await
+        }
+        async fn _process_no_response(
+            &mut self,
+            request: BorrowedRequest<'_>,
+            timeout_ms: u32,
+        ) -> Result<(), Error<I::Error>> {
+            self._send(request).await?;
+            match select(
+                pin!(self.interface.wait_ready()),
+                pin!(self.timer.delay_ms(timeout_ms)),
+            )
+            .await
+            {
+                futures::future::Either::Left((wait_res, _)) => wait_res?,
+                futures::future::Either::Right((_timeout, _)) => return Err(Error::TimeoutAck),
+            };
+            self.receive_ack().await
+        }
+    }
+    impl<I: AsyncInterface, T, const N: usize> Pn532Async<I, T, N> {
+        /// Create a Pn532 instance
+        pub fn new(interface: I, timer: T) -> Self {
+            Pn532Async {
+                interface,
+                timer,
+                buf: [0; N],
+            }
+        }
+
+        /// Send a request.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use pn532::Request;
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.send(&Request::GET_FIRMWARE_VERSION);
+        /// ```
+        #[inline]
+        pub async fn send<const M: usize>(
+            &mut self,
+            request: &Request<M>,
+        ) -> Result<(), Error<I::Error>> {
+            // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
+            self._send(request.borrow()).await
+        }
+        async fn _send(&mut self, request: BorrowedRequest<'_>) -> Result<(), Error<I::Error>> {
+            let data_len = request.data.len();
+            let frame_len = 2 + data_len as u8; // frame identifier + command + data
+
+            let mut data_sum = HOST_TO_PN532.wrapping_add(request.command as u8); // sum(command + data + frame identifier)
+            for &byte in request.data {
+                data_sum = data_sum.wrapping_add(byte);
+            }
+
+            const fn to_checksum(sum: u8) -> u8 {
+                (!sum).wrapping_add(1)
+            }
+
+            self.buf[0] = PREAMBLE[0];
+            self.buf[1] = PREAMBLE[1];
+            self.buf[2] = PREAMBLE[2];
+            self.buf[3] = frame_len;
+            self.buf[4] = to_checksum(frame_len);
+            self.buf[5] = HOST_TO_PN532;
+            self.buf[6] = request.command as u8;
+
+            self.buf[7..7 + data_len].copy_from_slice(request.data);
+
+            self.buf[7 + data_len] = to_checksum(data_sum);
+            self.buf[8 + data_len] = POSTAMBLE;
+
+            self.interface.write(&self.buf[..9 + data_len]).await?;
+            Ok(())
+        }
+
+        /// Receive an ACK frame.
+        /// This should be done after [`send`](Pn532::send) was called and the interface was checked to be ready.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use core::task::Poll;
+        /// use pn532::{Interface, Request};
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.send(&Request::GET_FIRMWARE_VERSION);
+        /// // do something else
+        /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
+        ///     pn532.receive_ack();
+        /// }
+        /// ```
+        pub async fn receive_ack(&mut self) -> Result<(), Error<I::Error>> {
+            let mut ack_buf = [0; 6];
+            self.interface.read(&mut ack_buf).await?;
+            if ack_buf != ACK {
+                Err(Error::BadAck)
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Receive a response frame.
+        /// This should be done after [`send`](Pn532::send) and [`receive_ack`](Pn532::receive_ack) was called and
+        /// the interface was checked to be ready.
+        ///
+        /// `response_len` is the largest expected length of the returned data.
+        ///
+        /// ```
+        /// # use pn532::doc_test_helper::get_pn532;
+        /// use core::task::Poll;
+        /// use pn532::{Interface, Request};
+        ///
+        /// let mut pn532 = get_pn532();
+        /// pn532.send(&Request::GET_FIRMWARE_VERSION);
+        /// // do something else
+        /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
+        ///     pn532.receive_ack();
+        /// }
+        /// // do something else
+        /// if let Poll::Ready(Ok(_)) = pn532.interface.wait_ready() {
+        ///     let result = pn532.receive_response(Request::GET_FIRMWARE_VERSION.command, 4);
+        /// }
+        /// ```
+        pub async fn receive_response(
+            &mut self,
+            sent_command: Command,
+            response_len: usize,
+        ) -> Result<&[u8], Error<I::Error>> {
+            let response_buf = &mut self.buf[..response_len + 9];
+            response_buf.fill(0); // zero out buf
+            self.interface.read(response_buf).await?;
+            let expected_response_command = sent_command as u8 + 1;
+            parse_response(response_buf, expected_response_command)
+        }
+
+        /// Send an ACK frame to force the PN532 to abort the current process.
+        /// In that case, the PN532 discontinues the last processing and does not answer anything
+        /// to the host controller.
+        /// Then, the PN532 starts again waiting for a new command.
+        pub async fn abort(&mut self) -> Result<(), Error<I::Error>> {
+            self.interface.write(&ACK).await?;
+            Ok(())
+        }
     }
 }
 
-impl<I: Interface, const N: usize> Pn532<I, (), N> {
-    /// Create a Pn532 instance without a timer
-    pub fn new_async(interface: I) -> Self {
-        Pn532 {
-            interface,
-            timer: (),
-            buf: [0; N],
-        }
-    }
-
-    /// Send a request, wait for an ACK and then wait for a response.
-    ///
-    /// `response_len` is the largest expected length of the returned data.
-    ///
-    /// ```
-    /// # use pn532::doc_test_helper::get_async_pn532;
-    /// use pn532::Request;
-    ///
-    /// let mut pn532 = get_async_pn532();
-    /// let future = pn532.process_async(&Request::GET_FIRMWARE_VERSION, 4);
-    /// ```
-    #[inline]
-    pub async fn process_async<const M: usize>(
-        &mut self,
-        request: &Request<M>,
-        response_len: usize,
-    ) -> Result<&[u8], Error<I::Error>> {
-        // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-        self._process_async(request.borrow(), response_len).await
-    }
-    async fn _process_async(
-        &mut self,
-        request: BorrowedRequest<'_>,
-        response_len: usize,
-    ) -> Result<&[u8], Error<I::Error>> {
-        let sent_command = request.command;
-        self._send(request)?;
-        self.wait_ready_future().await?;
-        self.receive_ack()?;
-        self.wait_ready_future().await?;
-        self.receive_response(sent_command, response_len)
-    }
-
-    /// Send a request and wait for an ACK.
-    ///
-    /// ```
-    /// # use pn532::doc_test_helper::get_async_pn532;
-    /// use pn532::Request;
-    ///
-    /// let mut pn532 = get_async_pn532();
-    /// let future = pn532.process_no_response_async(&Request::INLIST_ONE_ISO_A_TARGET);
-    #[inline]
-    pub async fn process_no_response_async<const M: usize>(
-        &mut self,
-        request: &Request<M>,
-    ) -> Result<(), Error<I::Error>> {
-        // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-        self._process_no_response_async(request.borrow()).await
-    }
-    async fn _process_no_response_async(
-        &mut self,
-        request: BorrowedRequest<'_>,
-    ) -> Result<(), Error<I::Error>> {
-        self._send(request)?;
-        self.wait_ready_future().await?;
-        self.receive_ack()?;
-        Ok(())
-    }
-
-    fn wait_ready_future(&mut self) -> WaitReadyFuture<I> {
-        WaitReadyFuture {
-            interface: &mut self.interface,
-        }
-    }
-}
-
-fn parse_response<E: Debug>(
+fn parse_response<E: core::fmt::Debug>(
     response_buf: &[u8],
     expected_response_command: u8,
 ) -> Result<&[u8], Error<E>> {
@@ -391,20 +581,4 @@ fn parse_response<E: Debug>(
     }
     // Adjust response buf and return it
     Ok(&response_buf[7..5 + frame_len as usize])
-}
-
-struct WaitReadyFuture<'a, I> {
-    interface: &'a mut I,
-}
-
-impl<'a, I: Interface> Future for WaitReadyFuture<'a, I> {
-    type Output = Result<(), I::Error>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let poll = self.interface.wait_ready();
-        if poll.is_pending() {
-            // tell the excecutor to poll this future again
-            cx.waker().clone().wake();
-        }
-        poll
-    }
 }

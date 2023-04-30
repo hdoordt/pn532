@@ -1,3 +1,4 @@
+#![feature(async_fn_in_trait, impl_trait_projections)]
 //! `no_std` implementation of the [`Pn532`] protocol using `embedded_hal` traits.
 //!
 //! Since communication with the Pn532 can be rather slow at times,
@@ -57,7 +58,9 @@ use core::fmt::Debug;
 use core::task::Poll;
 use core::time::Duration;
 
-pub use crate::protocol::{Error, Pn532};
+use embedded_hal_async::delay::DelayUs;
+
+pub use crate::protocol::{Error, sync::Pn532, asynk::Pn532Async};
 pub use crate::requests::Request;
 
 pub mod i2c;
@@ -96,6 +99,32 @@ impl<I: Interface> Interface for &mut I {
 
     fn read(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
         I::read(self, buf)
+    }
+}
+
+pub trait AsyncInterface {
+    type Error: Debug;
+
+    async fn write(&mut self, frame: &[u8]) -> Result<(), Self::Error>;
+
+    async fn wait_ready(&mut self) -> Result<(), Self::Error>;
+
+    async fn read(&mut self, buf: &mut [u8]) -> Result<(), Self::Error>;
+}
+
+impl<A: AsyncInterface> AsyncInterface for &mut A {
+    type Error = A::Error;
+
+    async fn write(&mut self, frame: &[u8]) -> Result<(), Self::Error> {
+        A::write(self, frame).await
+    }
+
+    async fn wait_ready(&mut self) -> Result<(), Self::Error> {
+        A::wait_ready(self).await
+    }
+
+    async fn read(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
+        A::read(self, buf).await
     }
 }
 
