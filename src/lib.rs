@@ -1,3 +1,4 @@
+#![allow(incomplete_features)]
 #![feature(async_fn_in_trait, impl_trait_projections)]
 //! `no_std` implementation of the [`Pn532`] protocol using `embedded_hal` traits.
 //!
@@ -58,9 +59,7 @@ use core::fmt::Debug;
 use core::task::Poll;
 use core::time::Duration;
 
-use embedded_hal_async::delay::DelayUs;
-
-pub use crate::protocol::{Error, sync::Pn532, asynk::Pn532Async};
+pub use crate::protocol::{Error, sync::Pn532, asynchronous::Pn532Async};
 pub use crate::requests::Request;
 
 pub mod i2c;

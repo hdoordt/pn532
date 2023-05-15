@@ -278,12 +278,12 @@ pub mod sync {
     }
 }
 
-pub mod asynk {
+pub mod asynchronous {
     use core::pin::pin;
+    use core::time::Duration;
 
     use embedded_hal_async::delay::DelayUs;
     use futures::future::select;
-    use rtt_target::rprintln;
 
     use crate::protocol::{HOST_TO_PN532, POSTAMBLE, PREAMBLE};
     use crate::requests::{BorrowedRequest, Command};
@@ -337,23 +337,24 @@ pub mod asynk {
             &mut self,
             request: &Request<M>,
             response_len: usize,
-            timeout_ms: u32,
+            timeout: Duration,
         ) -> Result<&[u8], Error<I::Error>> {
             // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-            self._process(request.borrow(), response_len, timeout_ms)
+            self._process(request.borrow(), response_len, timeout)
                 .await
         }
         async fn _process(
             &mut self,
             request: BorrowedRequest<'_>,
             response_len: usize,
-            timeout_ms: u32,
+            timeout: Duration,
         ) -> Result<&[u8], Error<I::Error>> {
             let sent_command = request.command;
+
             self._send(request).await?;
             match select(
                 pin!(self.interface.wait_ready()),
-                pin!(self.timer.delay_ms(timeout_ms)),
+                pin!(self.timer.delay_ms(timeout.as_millis() as u32)),
             )
             .await
             {
@@ -363,7 +364,7 @@ pub mod asynk {
             self.receive_ack().await?;
             match select(
                 pin!(self.interface.wait_ready()),
-                pin!(self.timer.delay_ms(timeout_ms)),
+                pin!(self.timer.delay_ms(timeout.as_millis() as u32)),
             )
             .await
             {
@@ -389,21 +390,21 @@ pub mod asynk {
         pub async fn process_no_response<const M: usize>(
             &mut self,
             request: &Request<M>,
-            timeout_ms: u32,
+            timeout: Duration,
         ) -> Result<(), Error<I::Error>> {
             // codegen trampoline: https://github.com/rust-lang/rust/issues/77960
-            self._process_no_response(request.borrow(), timeout_ms)
+            self._process_no_response(request.borrow(), timeout)
                 .await
         }
         async fn _process_no_response(
             &mut self,
             request: BorrowedRequest<'_>,
-            timeout_ms: u32,
+            timeout: Duration,
         ) -> Result<(), Error<I::Error>> {
             self._send(request).await?;
             match select(
                 pin!(self.interface.wait_ready()),
-                pin!(self.timer.delay_ms(timeout_ms)),
+                pin!(self.timer.delay_ms(timeout.as_millis() as u32)),
             )
             .await
             {

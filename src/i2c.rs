@@ -123,7 +123,6 @@ where
 
     async fn wait_ready(&mut self) -> Result<(), Self::Error> {
         let mut buf = [0];
-
         loop {
             self.i2c.read(I2C_ADDRESS, &mut buf).await?;
             if buf[0] == PN532_I2C_READY {
